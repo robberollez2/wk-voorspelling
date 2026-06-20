@@ -191,6 +191,29 @@ See `models/metrics.json` after training.
 
 ---
 
+## Results
+
+Hold-out **test set (2024+, 3,696 matches incl. mirrored neutral rows)** from a
+full 100-trial run:
+
+| Model | Accuracy | Log Loss | Brier | ROC AUC (OvR) |
+| --- | --- | --- | --- | --- |
+| XGBoost | 0.581 | 0.882 | 0.522 | 0.741 |
+| LightGBM | 0.583 | 0.882 | 0.522 | 0.741 |
+| Poisson | 0.588 | 0.885 | 0.522 | 0.744 |
+| **Ensemble** | **0.581** | **0.881** | **0.521** | **0.743** |
+
+- **Ensemble weights:** XGBoost 0.55 · LightGBM 0.10 · Poisson 0.35
+- **TimeSeriesSplit CV:** log loss 0.903 ± 0.014, accuracy 0.579 ± 0.008
+- **Poisson expected-goals MAE:** home 1.00, away 0.86
+- **Top SHAP features:** `elo_expected_home` ≫ `neutral` > `elo_difference` >
+  `tournament_importance` > `away_elo` > recent-form / head-to-head features
+
+> These honest numbers reflect the leak-corrected data. A naive model that keeps
+> the raw neutral labelling reports a misleadingly higher ~66% accuracy by
+> exploiting the "winner is listed as home" artifact in neutral matches — which
+> carries no real predictive value. See *Notes & assumptions* below.
+
 ## Extending to player data (future-proofing)
 
 The pipeline is built around a single `FeatureBuilder` that owns all state. To
@@ -208,6 +231,16 @@ No other module needs to change — the models, ensemble and interfaces consume
 
 ## Notes & assumptions
 
+- **Neutral-match leakage (important).** In the source data, neutral-venue
+  matches list the *winner* as the "home" team (≈77% home / ≈0.5% away wins,
+  consistently across every era). Left untreated, a model simply learns
+  "neutral ⇒ home wins", which is useless for a real neutral fixture where the
+  user picks the order arbitrarily. This is corrected in two places:
+  (1) **training** mirrors every neutral match (swap teams + score, flip label)
+  so the model learns symmetric, strength-based behaviour; (2) **inference**
+  averages a neutral prediction over both team orderings, guaranteeing the
+  result is order-invariant. Non-neutral matches keep their genuine home
+  advantage.
 - The raw data is cleaned defensively (malformed rows, duplicates, invalid
   scores and self-matches are dropped). One malformed row in the shipped data
   is skipped automatically.

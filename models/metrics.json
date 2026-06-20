@@ -1,0 +1,64 @@
+{
+  "n_features": 70,
+  "n_train": 57221,
+  "n_val": 4239,
+  "n_test": 3696,
+  "test": {
+    "xgboost": {
+      "accuracy": 0.5814393939393939,
+      "log_loss": 0.8824915289878845,
+      "brier_score": 0.5222944021224976,
+      "roc_auc_ovr_macro": 0.7407782724903799
+    },
+    "lightgbm": {
+      "accuracy": 0.5830627705627706,
+      "log_loss": 0.8823703104710814,
+      "brier_score": 0.5220345075616281,
+      "roc_auc_ovr_macro": 0.7411100350133898
+    },
+    "poisson": {
+      "accuracy": 0.5882034632034632,
+      "log_loss": 0.8849468747619027,
+      "brier_score": 0.5221719047060668,
+      "roc_auc_ovr_macro": 0.7436599919112398
+    },
+    "ensemble": {
+      "accuracy": 0.5811688311688312,
+      "log_loss": 0.8814723204107922,
+      "brier_score": 0.5212470292528484,
+      "roc_auc_ovr_macro": 0.7428700537030141
+    },
+    "poisson_goal_mae": {
+      "home": 0.9959985130345199,
+      "away": 0.8558735289155944
+    }
+  },
+  "ensemble_weights": {
+    "xgboost": 0.5500000000000002,
+    "lightgbm": 0.1,
+    "poisson": 0.34999999999999987
+  },
+  "time_series_cv": {
+    "cv_log_loss_mean": 0.9026147961616516,
+    "cv_log_loss_std": 0.0141007407383266,
+    "cv_accuracy_mean": 0.5787825766645179,
+    "cv_accuracy_std": 0.007977524639980372
+  },
+  "shap_top_features": {
+    "elo_expected_home": 0.4155380427837372,
+    "neutral": 0.06602328270673752,
+    "elo_difference": 0.05310474708676338,
+    "tournament_importance": 0.03043673187494278,
+    "away_elo": 0.029191523790359497,
+    "away_losses_last_20": 0.02636048197746277,
+    "home_losses_last_20": 0.020484020933508873,
+    "away_weighted_goal_diff": 0.019307002425193787,
+    "h2h_goal_difference": 0.018539363518357277,
+    "home_weighted_goal_diff": 0.01820574887096882,
+    "home_goals_conceded_last_10": 0.01746075414121151,
+    "home_goals_scored_last_20": 0.016309766098856926,
+    "home_draws_last_20": 0.01611519232392311,
+    "away_goals_scored_last_20": 0.01488562673330307,
+    "away_points_last_20": 0.014098603278398514
+  }
+}

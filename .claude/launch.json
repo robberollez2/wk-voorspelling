@@ -1,0 +1,16 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "football-ai",
+      "runtimeExecutable": "C:/Users/robbe/Desktop/football_ai/.venv/Scripts/python.exe",
+      "runtimeArgs": [
+        "-m", "streamlit", "run",
+        "C:/Users/robbe/Desktop/football_ai/app.py",
+        "--server.port", "8520",
+        "--server.headless", "true"
+      ],
+      "port": 8520
+    }
+  ]
+}
