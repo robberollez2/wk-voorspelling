@@ -228,25 +228,40 @@ See `models/metrics.json` after training.
 ## Results
 
 Hold-out **test set (2024+, 3,696 matches incl. mirrored neutral rows)** from a
-full 100-trial run:
+full 100-trial run (87 features):
 
 | Model | Accuracy | Log Loss | Brier | ROC AUC (OvR) |
 | --- | --- | --- | --- | --- |
-| XGBoost | 0.581 | 0.882 | 0.522 | 0.741 |
-| LightGBM | 0.583 | 0.882 | 0.522 | 0.741 |
-| Poisson | 0.588 | 0.885 | 0.522 | 0.744 |
-| **Ensemble** | **0.581** | **0.881** | **0.521** | **0.743** |
+| XGBoost | 0.586 | 0.881 | 0.521 | 0.741 |
+| LightGBM | 0.587 | 0.883 | 0.522 | 0.739 |
+| Dixon-Coles | 0.577 | 0.902 | 0.531 | 0.742 |
+| Equal-weight mean | 0.587 | 0.881 | 0.520 | 0.744 |
+| **Stacked ensemble** | **0.585** | **0.878** | **0.519** | **0.745** |
 
-- **Ensemble weights:** XGBoost 0.55 · LightGBM 0.10 · Poisson 0.35
-- **TimeSeriesSplit CV:** log loss 0.903 ± 0.014, accuracy 0.579 ± 0.008
-- **Poisson expected-goals MAE:** home 1.00, away 0.86
-- **Top SHAP features:** `elo_expected_home` ≫ `neutral` > `elo_difference` >
-  `tournament_importance` > `away_elo` > recent-form / head-to-head features
+- **TimeSeriesSplit CV:** log loss 0.900 ± 0.014, accuracy 0.581 ± 0.007
+- **Dixon-Coles expected-goals MAE:** home 1.00, away 0.87
+- **Top SHAP features:** `elo_expected_home` ≫ `neutral` ≈ `elo_difference` >
+  `away_matches_played` (experience) > `tournament_importance` >
+  `home_matches_played` > recent-form / weighted-form features
 
-> These honest numbers reflect the leak-corrected data. A naive model that keeps
-> the raw neutral labelling reports a misleadingly higher ~66% accuracy by
-> exploiting the "winner is listed as home" artifact in neutral matches — which
-> carries no real predictive value. See *Notes & assumptions* below.
+**Improvement vs. the previous baseline** (XGB+LGB+generic-Poisson, fixed
+weights, 70 features):
+
+| Metric | Baseline | This model | Δ |
+| --- | --- | --- | --- |
+| Log Loss | 0.8815 | **0.8776** | −0.0039 |
+| Brier | 0.5212 | **0.5194** | −0.0018 |
+| ROC AUC | 0.743 | **0.745** | +0.002 |
+| Accuracy | 0.581 | **0.585** | +0.004 |
+
+> **A note on accuracy.** International match outcomes have a hard predictive
+> ceiling — even bookmakers land around 55-60% three-class accuracy. The gains
+> here are therefore mostly in **calibration** (log loss / Brier), **ranking**
+> (ROC AUC) and a much stronger goal/scoreline model (Dixon-Coles), rather than a
+> dramatic accuracy jump, which would not be honestly achievable. A naive model
+> that keeps the raw neutral labelling reports a *misleadingly* higher ~66%
+> accuracy by exploiting the "winner is listed as home" leak in neutral
+> matches — which carries no real predictive value. See *Notes & assumptions*.
 
 ## Player data & extending the layer
 
