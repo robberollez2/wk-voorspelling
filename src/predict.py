@@ -20,14 +20,9 @@ import pandas as pd
 
 from . import config
 from .config import get_logger
+from .dixon_coles import DixonColesModel
 from .features import FeatureBuilder
-from .poisson import (
-    PoissonGoalModel,
-    most_likely_score,
-    outcome_probabilities,
-    scoreline_matrix,
-    top_scorelines,
-)
+from .poisson import most_likely_score, top_scorelines
 from .preprocess import (
     TOURNAMENT_CATEGORIES,
     NameMap,
@@ -114,11 +109,9 @@ class Predictor:
         self.name_map: NameMap = joblib.load(config.NAME_MAP_PKL)
         self.xgb_model = joblib.load(config.XGB_MODEL_PKL)
         self.lgb_model = joblib.load(config.LGB_MODEL_PKL)
-        self.weights: dict[str, float] = joblib.load(config.ENSEMBLE_WEIGHTS_PKL)
-
-        self.poisson = PoissonGoalModel()
-        self.poisson.home_model = joblib.load(config.POISSON_HOME_PKL)
-        self.poisson.away_model = joblib.load(config.POISSON_AWAY_PKL)
+        self.dc: DixonColesModel = joblib.load(config.DIXON_COLES_PKL)
+        self.stacker = joblib.load(config.STACKER_PKL)
+        self.stack_order: list[str] = joblib.load(config.ENSEMBLE_WEIGHTS_PKL)
         logger.info("Predictor loaded (%d teams, last data %s)",
                     len(self.builder.teams_), self.builder.last_date_)
 
@@ -168,20 +161,43 @@ class Predictor:
         neutral: bool,
         category: str,
         importance: float,
-    ) -> tuple[dict[str, np.ndarray], float, float]:
-        """Score one ordering: classifier probabilities and Poisson rates.
+    ) -> tuple[np.ndarray, dict[str, np.ndarray], float, float]:
+        """Score one ordering with every model + the stacked ensemble.
 
-        Returns ``(probs, lam_home, lam_away)`` where each probability vector is
-        ordered ``[away, draw, home]``.
+        Returns ``(stacked_probs, model_probs, lam_home, lam_away)`` where each
+        probability vector is ordered ``[away, draw, home]``.
         """
         X = self.builder.transform_one(home, away, date, neutral, category, importance)
         X = X[self.feature_columns]
-        probs = {
+        model_probs = {
             "xgboost": np.asarray(self.xgb_model.predict_proba(X)[0], dtype=float),
             "lightgbm": np.asarray(self.lgb_model.predict_proba(X)[0], dtype=float),
+            "dixon_coles": self.dc.outcome_probabilities(home, away, neutral),
         }
-        lam_home, lam_away = self.poisson.predict_expected(X)
-        return probs, float(lam_home[0]), float(lam_away[0])
+        stacked = self._stack(model_probs)
+        lam_home, lam_away = self.dc.predict_expected(home, away, neutral)
+        return stacked, model_probs, float(lam_home), float(lam_away)
+
+    def _stack(self, model_probs: dict[str, np.ndarray]) -> np.ndarray:
+        """Combine per-model probabilities with the logistic stacker."""
+        feats = np.hstack([
+            np.log(np.clip(model_probs[name], 1e-6, 1.0)) for name in self.stack_order
+        ]).reshape(1, -1)
+        return np.asarray(self.stacker.predict_proba(feats)[0], dtype=float)
+
+    @staticmethod
+    def _symmetrize(p1: np.ndarray, p2: np.ndarray) -> np.ndarray:
+        """Average a fixture's probabilities with its swapped-ordering version.
+
+        ``p1`` is ``[away, draw, home]`` for ``(home, away)`` and ``p2`` for the
+        reversed ``(away, home)``; the result is again ``[away, draw, home]``.
+        """
+        p_away = (p1[0] + p2[2]) / 2.0
+        p_draw = (p1[1] + p2[1]) / 2.0
+        p_home = (p1[2] + p2[0]) / 2.0
+        out = np.array([p_away, p_draw, p_home], dtype=float)
+        total = out.sum()
+        return out / total if total > 0 else out
 
     def predict(
         self,
@@ -221,31 +237,24 @@ class Predictor:
         if away not in self.builder.teams_:
             logger.warning("Away team '%s' unseen in training data; using neutral priors.", away)
 
-        probs1, lam_home, lam_away = self._raw_scores(home, away, match_date, neutral, category, importance)
-        probs: dict[str, np.ndarray] = {}
+        stacked1, mprobs1, lam_home, lam_away = self._raw_scores(
+            home, away, match_date, neutral, category, importance)
         if neutral:
-            # Average over both orderings -> order-invariant neutral prediction.
-            probs2, lam_h2, lam_a2 = self._raw_scores(away, home, match_date, neutral, category, importance)
-            for name in ("xgboost", "lightgbm"):
-                p1, p2 = probs1[name], probs2[name]  # each [away, draw, home]
-                p_home = (p1[2] + p2[0]) / 2.0
-                p_draw = (p1[1] + p2[1]) / 2.0
-                p_away = (p1[0] + p2[2]) / 2.0
-                probs[name] = np.array([p_away, p_draw, p_home])
+            # Average both orderings -> exactly order-invariant neutral prediction.
+            stacked2, mprobs2, lam_h2, lam_a2 = self._raw_scores(
+                away, home, match_date, neutral, category, importance)
+            stacked = self._symmetrize(stacked1, stacked2)
+            model_probs = {n: self._symmetrize(mprobs1[n], mprobs2[n]) for n in mprobs1}
             lam_home = (lam_home + lam_a2) / 2.0
             lam_away = (lam_away + lam_h2) / 2.0
         else:
-            probs = {name: probs1[name] for name in ("xgboost", "lightgbm")}
+            stacked = stacked1
+            model_probs = mprobs1
 
-        matrix = scoreline_matrix(lam_home, lam_away)
-        probs["poisson"] = outcome_probabilities(matrix)
+        p_away, p_draw, p_home = float(stacked[0]), float(stacked[1]), float(stacked[2])
 
-        blended = sum(self.weights[name] * probs[name] for name in self.weights)
-        blended = np.asarray(blended, dtype=float)
-        blended /= blended.sum()
-        p_away, p_draw, p_home = (float(blended[0]), float(blended[1]), float(blended[2]))
-
-        # --- scorelines ---------------------------------------------------- #
+        # --- scorelines (Dixon-Coles corrected) ---------------------------- #
+        matrix = self.dc.matrix_from_lambdas(lam_home, lam_away)
         (ml_h, ml_a), ml_prob = most_likely_score(matrix)
         tops = top_scorelines(matrix, top_n=5)
 
@@ -269,7 +278,7 @@ class Predictor:
             away_elo=self.builder.team_elo(away),
             score_matrix=matrix,
             model_probs={
-                name: (float(p[2]), float(p[1]), float(p[0])) for name, p in probs.items()
+                name: (float(p[2]), float(p[1]), float(p[0])) for name, p in model_probs.items()
             },
         )
 

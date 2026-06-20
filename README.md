@@ -9,8 +9,11 @@ a tournament and a date it returns:
 - The **most likely scoreline** and the **top-5 scorelines**
 
 It combines an **XGBoost** classifier, a **LightGBM** classifier and a
-**Poisson** goal model into a weighted ensemble, on top of leak-free temporal
-features (Elo ratings, rolling form, head-to-head, tournament importance).
+**Dixon-Coles** attack/defense goal model through a logistic-regression
+**stacking** meta-learner, on top of leak-free temporal features (Elo ratings,
+rolling form, head-to-head, rest/fatigue, venue-specific form, Elo momentum,
+tournament importance) plus an optional **StatsBomb squad-strength** player
+layer.
 
 ```
 Belgium vs Netherlands
@@ -42,14 +45,17 @@ Top 5 outcomes:
 | **Elo ratings** | Full World-Football-Elo system (start 1500, home-advantage bonus, margin-of-victory and tournament-importance scaling). |
 | **Rolling form** | Wins/draws/losses, goals for/against, goal difference and points over the last **5 / 10 / 20** matches per team. |
 | **Recency weighting** | Exponentially-decayed weighted form (configurable half-life). |
+| **Fatigue & momentum** | Rest days since the last match, matches-played experience, venue-specific (home/away) form, win/loss streaks and Elo momentum. |
 | **Head-to-head** | Directional H2H record and goal difference over the last **10 years**. |
 | **Tournament importance** | Raw tournaments are bucketed (Friendly, Nations League, World Cup (Q), Continental (Q), Confederations Cup, Continental Championship, …) and one-hot encoded. |
-| **Scoreline model** | Independent-Poisson scoreline matrix (0-0 … 10-10) → top scorelines and an independent W/D/L estimate. |
-| **Hyperparameter tuning** | **Optuna** (default 100 trials per classifier) optimising **log loss**. |
-| **Time-aware validation** | No random splits. Train ≤ 2020, validate 2021-2023, test 2024+, plus a `TimeSeriesSplit` report. |
+| **Dixon-Coles goal model** | Team attack/defense strengths with home advantage, **exponential time decay** and the low-score (`rho`) correction → expected goals and a corrected scoreline matrix (0-0 … 10-10). |
+| **Player layer** | Optional **StatsBomb** squad-strength feature built from line-ups of covered men's tournaments (World Cups, Euro 2020/24, Copa 2024, AFCON 2023), with a neutral fallback elsewhere. |
+| **Stacking ensemble** | A multinomial logistic-regression meta-learner combines **and calibrates** the three models (beats fixed weights on log loss / Brier). |
+| **Hyperparameter tuning** | **Optuna** (default 100 trials per classifier) optimising **log loss**; the Dixon-Coles time-decay is searched too. |
+| **Time-aware validation** | No random splits. Train ≤ 2020, validate 2021-2023, test 2024+, plus a `TimeSeriesSplit` report. Every Dixon-Coles fit only sees matches before the split it scores. |
 | **Explainability** | **SHAP** global feature importances (saved as PNG + table). |
 | **Interfaces** | A **Streamlit** web app and an interactive **CLI**. |
-| **Engineering** | Type hints, logging, joblib persistence, parquet caching, vectorized pandas, designed to extend to player-level data later. |
+| **Engineering** | Type hints, logging, joblib persistence, parquet caching, vectorized pandas, test suite, modular player-data layer. |
 
 ---
 
@@ -66,9 +72,12 @@ football_ai/
 │   ├── preprocess.py            # loading, normalization, targets, tournament buckets
 │   ├── elo.py                   # Elo rating system
 │   ├── features.py              # leak-free FeatureBuilder (training + inference)
-│   ├── poisson.py               # Poisson goal model + scoreline maths
-│   ├── train.py                 # Optuna tuning, ensemble, metrics, SHAP
+│   ├── dixon_coles.py           # Dixon-Coles attack/defense goal model
+│   ├── player_data.py           # StatsBomb squad-strength player layer
+│   ├── poisson.py               # scoreline maths helpers
+│   ├── train.py                 # Optuna tuning, stacking ensemble, metrics, SHAP
 │   └── predict.py               # Predictor class + interactive CLI
+├── tests/test_basic.py          # unit tests (no trained models needed)
 ├── app.py                       # Streamlit web app
 ├── predict.py                   # root entry point → src.predict
 ├── requirements.txt
@@ -114,11 +123,15 @@ python -m src.train --no-cache      # ignore cached preprocessing/features
 Training writes everything to `models/`:
 
 ```
-xgb_model.joblib  lgb_model.joblib  poisson_home.joblib  poisson_away.joblib
-ensemble_weights.joblib  feature_builder.joblib  feature_list.joblib
-name_map.joblib  metrics.json  shap_summary.png  shap_summary.joblib
-preprocessed.parquet  feature_matrix.parquet
+xgb_model.joblib  lgb_model.joblib  dixon_coles.joblib  stacker.joblib
+feature_builder.joblib  feature_list.joblib  name_map.joblib
+metrics.json  shap_summary.png  shap_summary.joblib
+preprocessed.parquet  feature_matrix.parquet  squad_strength.parquet
 ```
+
+> The first run fetches StatsBomb line-ups once (cached to
+> `squad_strength.parquet`). Use `python -m src.train --no-player-data` to skip
+> the player layer (e.g. offline).
 
 ### 2. Predict from the terminal
 
@@ -165,22 +178,43 @@ team's colours), and a model-transparency panel with the global SHAP summary.
 `0 = away win`, `1 = draw`, `2 = home win` (kept consistent everywhere,
 including the model `predict_proba` column order).
 
-### Ensemble
+### Ensemble (stacking)
+
+The three base models each output `[away, draw, home]` probabilities. A
+multinomial **logistic-regression stacker** takes their log-probabilities and
+produces the final, calibrated probabilities:
 
 ```
-P(outcome) = w_xgb · P_xgboost + w_lgb · P_lightgbm + w_poisson · P_poisson
+P(outcome) = softmax( W · [log P_xgb , log P_lgb , log P_dixoncoles] + b )
 ```
 
-The weights are found by a simplex grid-search that minimises **validation**
-log loss. The Poisson contribution comes from summing the scoreline matrix into
-home/draw/away probabilities, while expected goals and scorelines come directly
-from the two Poisson regressions.
+The stacker is fitted on the **validation** split (which the base models do not
+train on), so it learns how much to trust each model and corrects miscalibration
+at the same time. It beats fixed weighted-averaging on log loss and Brier; an
+equal-weight mean is also reported for comparison.
 
-### Expected goals & scorelines
+### Dixon-Coles goal model, expected goals & scorelines
 
-The Poisson goal model estimates `λ_home` and `λ_away`. Assuming independent
-Poisson scoring, `P(home=i, away=j) = Poisson(i; λ_home) · Poisson(j; λ_away)`.
-The matrix yields the most likely score and the top-5 scorelines.
+Each team has an *attack* and *defense* strength; on non-neutral ground a home
+term is added. Strengths are fitted by a convex, **time-decayed** weighted
+Poisson regression (recent matches count more), and the Dixon-Coles `rho`
+correction adjusts the 0-0/1-0/0-1/1-1 cells (improving draws). For a fixture
+this gives `λ_home`, `λ_away` and a corrected matrix
+`P(home=i, away=j)`, which yields the most likely score and the top-5
+scorelines. Because the home term vanishes on neutral ground, the model is
+naturally **immune to the neutral-labelling leak** described below.
+
+### Player layer (StatsBomb)
+
+`player_data.py` fetches line-ups for covered men's international tournaments
+from StatsBomb open-data and maintains a per-player result rating; a team's
+**squad strength** for a match is the leak-free mean rating of its starting XI.
+FBref is blocked to automated access and Transfermarkt needs fragile scraping,
+so StatsBomb is the practical free source here — it covers ≈3% of matches (the
+marquee tournaments), and every other match (and any future fixture without a
+supplied line-up) falls back to a neutral default plus a `squad_data_available`
+flag. The feature therefore sharpens World Cup / Euro / Copa / AFCON predictions
+without affecting the rest.
 
 ### Validation & metrics
 
@@ -214,18 +248,29 @@ full 100-trial run:
 > exploiting the "winner is listed as home" artifact in neutral matches — which
 > carries no real predictive value. See *Notes & assumptions* below.
 
-## Extending to player data (future-proofing)
+## Player data & extending the layer
 
-The pipeline is built around a single `FeatureBuilder` that owns all state. To
-add player-level signals (squad strength, availability, lineups) you would:
+The StatsBomb squad-strength layer (`src/player_data.py`) is already wired in:
+it builds a leak-free per-match squad strength and merges it as features
+(`home_squad_strength`, `away_squad_strength`, `squad_strength_diff`,
+`squad_data_available`). Because FBref blocks automated access and StatsBomb
+open-data only covers a handful of men's tournaments, the signal is **sparse by
+design** — it improves predictions for the covered marquee fixtures and falls
+back to a neutral default everywhere else, so it cannot (and is not claimed to)
+move the global test accuracy much.
 
-1. add the new raw columns to the preprocessing step,
-2. extend `FeatureBuilder._compute_features` with the new features (they are
-   automatically picked up by `feature_columns_`),
-3. retrain.
+To add richer player signals (full line-ups, availability, market values, xG per
+player) the pipeline only needs:
 
-No other module needs to change — the models, ensemble and interfaces consume
-`feature_columns_` generically.
+1. a loader that yields a leak-free `(date, {teamA, teamB}) -> {team: value}`
+   lookup (mirroring `player_data.squad_lookup`),
+2. a few lines in `FeatureBuilder._squad_stats` / `_compute_features` (new
+   features are picked up by `feature_columns_` automatically),
+3. a retrain.
+
+No model, ensemble or interface code needs to change — everything consumes
+`feature_columns_` generically. Supplying a real expected line-up at inference
+time would let the squad features fire for future fixtures too.
 
 ---
 

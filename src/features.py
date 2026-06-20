@@ -26,6 +26,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from . import config
@@ -44,13 +45,23 @@ _DECAY_PER_STEP = 0.5 ** (1.0 / config.RECENCY_HALFLIFE)
 _H2H_DELTA = pd.Timedelta(days=int(config.H2H_YEARS * 365.25))
 
 
+_VENUE_WINDOW = 10  # matches used for venue-specific (home/away) form
+
+
 @dataclass
 class _TeamState:
-    """Bounded rolling log of a single team's recent appearances."""
+    """Bounded rolling state for a single team."""
 
     # Each entry: (timestamp, goals_for, goals_against, outcome) where outcome
     # is 2=win, 1=draw, 0=loss from the team's own perspective.
     log: deque = field(default_factory=lambda: deque(maxlen=_MAX_LOG))
+    # Elo rating after each match (for momentum).
+    elo_history: deque = field(default_factory=lambda: deque(maxlen=_MAX_LOG))
+    # Points (0/1/3) in recent non-neutral home / away matches (venue form).
+    home_points: deque = field(default_factory=lambda: deque(maxlen=_VENUE_WINDOW))
+    away_points: deque = field(default_factory=lambda: deque(maxlen=_VENUE_WINDOW))
+    last_date: pd.Timestamp | None = None
+    played: int = 0
 
 
 class FeatureBuilder:
@@ -69,6 +80,8 @@ class FeatureBuilder:
         self.elo = EloRatingSystem()
         self._teams: dict[str, _TeamState] = {}
         self._h2h: dict[tuple[str, str], list[tuple]] = {}
+        # Optional StatsBomb squad-strength lookup: (date_str, t1, t2) -> {team: strength}.
+        self._squad_lookup: dict[tuple[str, str, str], dict[str, float]] = {}
         self.feature_columns_: list[str] = []
         self.last_date_: pd.Timestamp | None = None
         self.teams_: list[str] = []
@@ -172,6 +185,75 @@ class FeatureBuilder:
             "h2h_goal_difference": float(goal_diff),
         }
 
+    @staticmethod
+    def _streak(log: deque) -> float:
+        """Signed current streak: +n consecutive wins, -n consecutive losses."""
+        entries = list(log)
+        if not entries:
+            return 0.0
+        last = entries[-1][3]
+        if last == 1:  # draw breaks both streaks
+            return 0.0
+        target = last
+        count = 0
+        for *_rest, outcome in reversed(entries):
+            if outcome == target:
+                count += 1
+            else:
+                break
+        count = min(count, 10)
+        return float(count) if target == 2 else float(-count)
+
+    def _dynamics_stats(
+        self, team: str, date: pd.Timestamp, prefix: str
+    ) -> dict[str, float]:
+        """Fatigue, experience, venue form, streak and Elo-momentum features."""
+        state = self._team(team)
+        # Rest days since the previous match (capped; long/unknown -> 365).
+        if state.last_date is not None:
+            rest = (date - state.last_date).days
+            rest = float(min(max(rest, 0), 365))
+        else:
+            rest = 365.0
+        # Elo momentum: current rating minus the rating 10 matches ago.
+        current_elo = self.elo.rating(team)
+        hist = state.elo_history
+        past_elo = hist[-10] if len(hist) >= 10 else (hist[0] if hist else self.elo.start)
+        momentum = current_elo - past_elo
+        # Venue-specific form (points rate, default neutral 0.5 when empty).
+        venue_pts = state.home_points if prefix == "home" else state.away_points
+        venue_rate = (sum(venue_pts) / (3.0 * len(venue_pts))) if venue_pts else 0.5
+        return {
+            f"{prefix}_rest_days": rest,
+            f"{prefix}_matches_played": float(np.log1p(state.played)),
+            f"{prefix}_venue_form": float(venue_rate),
+            f"{prefix}_streak": self._streak(state.log),
+            f"{prefix}_elo_momentum": float(momentum),
+        }
+
+    def _squad_stats(self, home: str, away: str, date: pd.Timestamp) -> dict[str, float]:
+        """StatsBomb squad-strength features (neutral default when unavailable)."""
+        lookup = getattr(self, "_squad_lookup", None)  # tolerate older pickles
+        if lookup:
+            t1, t2 = (home, away) if home <= away else (away, home)
+            key = (pd.Timestamp(date).strftime("%Y-%m-%d"), t1, t2)
+            squad = lookup.get(key)
+            if squad is not None:
+                hs = squad.get(home, 0.0)
+                as_ = squad.get(away, 0.0)
+                return {
+                    "home_squad_strength": hs,
+                    "away_squad_strength": as_,
+                    "squad_strength_diff": hs - as_,
+                    "squad_data_available": 1.0,
+                }
+        return {
+            "home_squad_strength": 0.0,
+            "away_squad_strength": 0.0,
+            "squad_strength_diff": 0.0,
+            "squad_data_available": 0.0,
+        }
+
     def _compute_features(
         self,
         home: str,
@@ -203,6 +285,11 @@ class FeatureBuilder:
 
         feats.update(self._h2h_stats(home, away, date))
 
+        home_dyn = self._dynamics_stats(home, date, "home")
+        away_dyn = self._dynamics_stats(away, date, "away")
+        feats.update(home_dyn)
+        feats.update(away_dyn)
+
         # Explicit difference features (help linear models & readability).
         feats["form_points_diff_10"] = (
             home_form["home_points_last_10"] - away_form["away_points_last_10"]
@@ -214,6 +301,12 @@ class FeatureBuilder:
         feats["weighted_points_diff"] = (
             feats["home_weighted_points"] - feats["away_weighted_points"]
         )
+        feats["rest_days_diff"] = home_dyn["home_rest_days"] - away_dyn["away_rest_days"]
+        feats["elo_momentum_diff"] = home_dyn["home_elo_momentum"] - away_dyn["away_elo_momentum"]
+        feats["venue_form_diff"] = home_dyn["home_venue_form"] - away_dyn["away_venue_form"]
+
+        # Player layer: StatsBomb squad strength (neutral default when absent).
+        feats.update(self._squad_stats(home, away, date))
 
         # Context features.
         feats["neutral"] = 1.0 if neutral else 0.0
@@ -247,12 +340,28 @@ class FeatureBuilder:
         else:
             home_outcome, away_outcome = 0, 2
 
-        self._team(home).log.append((date, home_score, away_score, home_outcome))
-        self._team(away).log.append((date, away_score, home_score, away_outcome))
+        home_state = self._team(home)
+        away_state = self._team(away)
+        home_state.log.append((date, home_score, away_score, home_outcome))
+        away_state.log.append((date, away_score, home_score, away_outcome))
         self._h2h.setdefault(self._pair_key(home, away), []).append(
             (date, home, away, home_score, away_score)
         )
+
+        home_points = 3 if home_outcome == 2 else 1 if home_outcome == 1 else 0
+        away_points = 3 if away_outcome == 2 else 1 if away_outcome == 1 else 0
+        if not neutral:  # venue-specific form only for real home/away matches
+            home_state.home_points.append(home_points)
+            away_state.away_points.append(away_points)
+        home_state.last_date = date
+        away_state.last_date = date
+        home_state.played += 1
+        away_state.played += 1
+
         self.elo.update(home, away, home_score, away_score, importance, neutral)
+        # Record post-match Elo for momentum (after the update above).
+        home_state.elo_history.append(self.elo.rating(home))
+        away_state.elo_history.append(self.elo.rating(away))
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -264,6 +373,7 @@ class FeatureBuilder:
         use_cache: bool = True,
         cache_path: Path | str = config.FEATURES_PARQUET,
         mirror_neutral: bool = True,
+        squad_lookup: dict | None = None,
     ) -> pd.DataFrame:
         """Fit the builder on the full history and return the feature matrix.
 
@@ -286,6 +396,8 @@ class FeatureBuilder:
             ``home_score``, ``away_score`` and ``is_mirror``.
         """
         cache_path = Path(cache_path)
+        if squad_lookup is not None:
+            self._squad_lookup = squad_lookup
         # State is always (re)built because it is required for inference and is
         # cheap; the expensive-to-recompute matrix itself is what we cache.
         rows: list[dict[str, float]] = []
@@ -316,7 +428,7 @@ class FeatureBuilder:
             rows.append(feats)
             meta.append({
                 "date": date, "year": int(years[i]), "result": int(results[i]),
-                "home_team": homes[i], "away_team": aways[i],
+                "home_team": homes[i], "away_team": aways[i], "neutral": neutral,
                 "home_score": int(hs[i]), "away_score": int(as_[i]), "is_mirror": 0,
             })
 
@@ -326,7 +438,7 @@ class FeatureBuilder:
                 rows.append(feats_m)
                 meta.append({
                     "date": date, "year": int(years[i]), "result": 2 - int(results[i]),
-                    "home_team": aways[i], "away_team": homes[i],
+                    "home_team": aways[i], "away_team": homes[i], "neutral": neutral,
                     "home_score": int(as_[i]), "away_score": int(hs[i]), "is_mirror": 1,
                 })
 
@@ -406,10 +518,11 @@ def build_features(
     df: pd.DataFrame,
     *,
     use_cache: bool = True,
+    squad_lookup: dict | None = None,
 ) -> tuple[pd.DataFrame, FeatureBuilder]:
     """Convenience wrapper returning ``(feature_matrix, fitted_builder)``."""
     builder = FeatureBuilder()
-    features = builder.fit_transform(df, use_cache=use_cache)
+    features = builder.fit_transform(df, use_cache=use_cache, squad_lookup=squad_lookup)
     return features, builder
 
 

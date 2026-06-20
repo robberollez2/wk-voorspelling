@@ -17,6 +17,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from src.dixon_coles import DixonColesModel  # noqa: E402
 from src.elo import EloRatingSystem, goal_difference_multiplier  # noqa: E402
 from src.features import FeatureBuilder  # noqa: E402
 from src.poisson import (  # noqa: E402
@@ -119,6 +120,39 @@ def test_feature_builder_no_nan_and_columns():
     assert not feats[builder.feature_columns_].isna().any().any()
     one = builder.transform_one("A", "B", pd.Timestamp("2000-06-01"), False, "Friendly")
     assert list(one.columns) == builder.feature_columns_
+    # Squad features exist and default to neutral when no StatsBomb lookup.
+    for col in ("home_squad_strength", "squad_strength_diff", "squad_data_available"):
+        assert col in builder.feature_columns_
+    assert (feats["squad_data_available"] == 0).all()
+
+
+def test_dixon_coles_model():
+    rng = np.random.default_rng(0)
+    strength = {"A": 3, "C": 2, "D": 1, "B": 0}
+    teams = list(strength)
+    dates = pd.date_range("2015-01-01", periods=80, freq="20D")
+    rows = []
+    for d in dates:
+        h, a = rng.choice(teams, size=2, replace=False)
+        hg = int(rng.poisson(0.8 + 0.4 * strength[h]))
+        ag = int(rng.poisson(0.8 + 0.4 * strength[a]))
+        rows.append((d, h, a, hg, ag, False))
+    df = pd.DataFrame(rows, columns=["date", "home_team", "away_team", "home_score", "away_score", "neutral"])
+
+    dc = DixonColesModel(xi=0.0).fit(df)
+    # Stronger attack -> higher attack coefficient.
+    assert dc.attack["A"] > dc.attack["B"]
+    matrix = dc.scoreline_matrix("A", "B", neutral=False)
+    assert abs(matrix.sum() - 1.0) < 1e-9
+    probs = dc.outcome_probabilities("A", "B", neutral=False)
+    assert abs(probs.sum() - 1.0) < 1e-9
+    assert probs[2] > probs[0]  # A should be favoured over B
+    # Neutral predictions are order-invariant.
+    p_ab = dc.outcome_probabilities("A", "B", neutral=True)
+    p_ba = dc.outcome_probabilities("B", "A", neutral=True)
+    assert abs(p_ab[2] - p_ba[0]) < 1e-9 and abs(p_ab[0] - p_ba[2]) < 1e-9
+    lam, mu = dc.predict_expected("A", "B", neutral=False)
+    assert lam > 0 and mu > 0
 
 
 def test_mirror_symmetry():

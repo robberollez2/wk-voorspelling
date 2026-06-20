@@ -211,7 +211,10 @@ def main() -> None:
     st.pyplot(score_heatmap(result))
 
     with st.expander("Model transparency"):
-        st.write("Ensemble weights:", {k: round(v, 3) for k, v in predictor.weights.items()})
+        st.caption(
+            "Ensemble: a logistic-regression **stacking** meta-learner combines and "
+            "calibrates XGBoost + LightGBM + Dixon-Coles. Per-model probabilities:"
+        )
         rows = []
         for name, (ph, pd_, pa) in result.model_probs.items():
             rows.append({"model": name, "home": f"{ph*100:.1f}%", "draw": f"{pd_*100:.1f}%", "away": f"{pa*100:.1f}%"})

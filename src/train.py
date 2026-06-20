@@ -4,11 +4,13 @@ Trains and serializes the full prediction stack:
 
 1. XGBoost classifier (Optuna-tuned on a time-based validation split).
 2. LightGBM classifier (Optuna-tuned likewise).
-3. Poisson goal model (expected home/away goals -> scoreline matrix).
-4. A weighted-average ensemble of the three outcome-probability sources.
+3. Dixon-Coles attack/defense goal model (expected goals + scorelines).
+4. A logistic-regression **stacking** meta-learner that combines and calibrates
+   the three outcome-probability sources.
 
 Validation strictly respects time order (no random splits): train on
-1872-2020, validate on 2021-2023, test on 2024+.  A TimeSeriesSplit
+1872-2020, validate on 2021-2023, test on 2024+.  Each Dixon-Coles fit only
+uses matches strictly before the split it scores.  A TimeSeriesSplit
 cross-validation report is also produced.  Metrics (accuracy, log loss, Brier,
 ROC AUC), SHAP feature importances and all model artifacts are written to
 ``models/``.
@@ -27,6 +29,7 @@ import joblib
 import numpy as np
 import optuna
 import pandas as pd
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, log_loss, roc_auc_score
 from sklearn.model_selection import TimeSeriesSplit
 
@@ -35,8 +38,8 @@ import xgboost as xgb
 
 from . import config
 from .config import get_logger
+from .dixon_coles import DixonColesModel
 from .features import build_features
-from .poisson import PoissonGoalModel, outcome_probabilities, scoreline_matrix
 from .preprocess import preprocess
 
 logger = get_logger(__name__)
@@ -63,6 +66,7 @@ def make_splits(features: pd.DataFrame, feature_columns: list[str]) -> dict[str,
             "y": part["result"].to_numpy(),
             "home_goals": part["home_score"].to_numpy(),
             "away_goals": part["away_score"].to_numpy(),
+            "meta": part[["home_team", "away_team", "neutral"]].reset_index(drop=True),
         }
 
     splits = {"train": subset(train_mask), "val": subset(val_mask), "test": subset(test_mask)}
@@ -196,58 +200,58 @@ def tune_lgb(splits: dict[str, Any], n_trials: int) -> tuple[dict[str, Any], lgb
 
 
 # --------------------------------------------------------------------------- #
-# Poisson outcome probabilities
+# Dixon-Coles fitting (with a small time-decay search)
 # --------------------------------------------------------------------------- #
-def poisson_outcome_probs(model: PoissonGoalModel, X: pd.DataFrame) -> np.ndarray:
-    """Outcome probabilities ``[away, draw, home]`` per row from the Poisson model."""
-    lam_home, lam_away = model.predict_expected(X)
-    probs = np.empty((len(X), 3), dtype=float)
-    for i in range(len(X)):
-        matrix = scoreline_matrix(lam_home[i], lam_away[i])
-        probs[i] = outcome_probabilities(matrix)
-    return probs
+def fit_dixon_coles(frame: pd.DataFrame, cutoff_year: int, xi: float) -> DixonColesModel:
+    """Fit a Dixon-Coles model on all matches up to (and including) a year."""
+    train = frame[frame["year"] <= cutoff_year]
+    return DixonColesModel(xi=xi).fit(train)
+
+
+def search_dixon_coles_xi(frame: pd.DataFrame, val_meta: pd.DataFrame, y_val: np.ndarray) -> float:
+    """Pick the time-decay rate minimising validation log loss."""
+    best_xi, best_loss = 0.0, np.inf
+    for xi in (0.0, 0.0004, 0.00076, 0.0012, 0.002):
+        model = fit_dixon_coles(frame, config.TRAIN_END_YEAR, xi)
+        proba = model.predict_proba(val_meta)
+        loss = log_loss(y_val, proba, labels=_LABELS)
+        if loss < best_loss:
+            best_loss, best_xi = loss, xi
+    logger.info("Dixon-Coles best xi=%.5f (val log loss %.4f)", best_xi, best_loss)
+    return best_xi
 
 
 # --------------------------------------------------------------------------- #
-# Ensemble
+# Ensemble: stacking meta-learner + simple-average baseline
 # --------------------------------------------------------------------------- #
-def optimize_ensemble_weights(
-    probas: dict[str, np.ndarray], y_val: np.ndarray, step: float = 0.05,
-    min_weight: float = 0.10,
-) -> dict[str, float]:
-    """Grid-search simplex weights minimising validation log loss.
-
-    A per-model floor (``min_weight``) keeps every model contributing to the
-    blend, which both honours the three-model ensemble design and regularises
-    the weights against over-fitting the validation split.
-    """
-    names = list(probas)
-    grid = np.arange(min_weight, 1.0 - min_weight + 1e-9, step)
-    best_loss = np.inf
-    best_w = np.array([1.0 / len(names)] * len(names))
-    for w0 in grid:
-        for w1 in grid:
-            w2 = 1.0 - w0 - w1
-            if w2 < min_weight - 1e-9 or w2 > 1.0 + 1e-9:
-                continue
-            weights = np.array([w0, w1, max(w2, 0.0)])
-            blended = (
-                weights[0] * probas[names[0]]
-                + weights[1] * probas[names[1]]
-                + weights[2] * probas[names[2]]
-            )
-            blended /= blended.sum(axis=1, keepdims=True)
-            loss = log_loss(y_val, blended, labels=_LABELS)
-            if loss < best_loss:
-                best_loss = loss
-                best_w = weights
-    logger.info("Best ensemble weights %s -> val log loss %.4f", dict(zip(names, best_w.round(3))), best_loss)
-    return {name: float(w) for name, w in zip(names, best_w)}
+_STACK_ORDER = ("xgboost", "lightgbm", "dixon_coles")
 
 
-def blend(probas: dict[str, np.ndarray], weights: dict[str, float]) -> np.ndarray:
-    """Weighted average of probability matrices, renormalised per row."""
-    blended = sum(weights[name] * probas[name] for name in weights)
+def _stack_features(probas: dict[str, np.ndarray]) -> np.ndarray:
+    """Concatenate per-model log-probabilities into a stacker design matrix."""
+    parts = [np.log(np.clip(probas[name], 1e-6, 1.0)) for name in _STACK_ORDER]
+    return np.hstack(parts)
+
+
+def fit_stacker(probas: dict[str, np.ndarray], y_val: np.ndarray) -> LogisticRegression:
+    """Fit a multinomial logistic-regression stacker on validation predictions."""
+    meta_X = _stack_features(probas)
+    # scikit-learn >=1.7 uses multinomial by default for multiclass with lbfgs.
+    stacker = LogisticRegression(C=1.0, max_iter=2000, solver="lbfgs")
+    stacker.fit(meta_X, y_val)
+    loss = log_loss(y_val, stacker.predict_proba(meta_X), labels=_LABELS)
+    logger.info("Stacker fitted (val log loss %.4f)", loss)
+    return stacker
+
+
+def stack_predict(stacker: LogisticRegression, probas: dict[str, np.ndarray]) -> np.ndarray:
+    """Apply the stacker to per-model probabilities -> ensemble probabilities."""
+    return stacker.predict_proba(_stack_features(probas))
+
+
+def mean_blend(probas: dict[str, np.ndarray]) -> np.ndarray:
+    """Simple equal-weight average baseline (for comparison)."""
+    blended = sum(probas[name] for name in _STACK_ORDER) / len(_STACK_ORDER)
     return blended / blended.sum(axis=1, keepdims=True)
 
 
@@ -321,11 +325,26 @@ def compute_shap(model: xgb.XGBClassifier, X: pd.DataFrame, feature_columns: lis
 # --------------------------------------------------------------------------- #
 # Orchestration
 # --------------------------------------------------------------------------- #
-def train(n_trials: int = config.DEFAULT_OPTUNA_TRIALS, use_cache: bool = True) -> dict[str, Any]:
+def train(
+    n_trials: int = config.DEFAULT_OPTUNA_TRIALS,
+    use_cache: bool = True,
+    use_player_data: bool = True,
+) -> dict[str, Any]:
     """Run the end-to-end training pipeline and persist all artifacts."""
     config.ensure_dirs()
     frame, name_map = preprocess(use_cache=use_cache)
-    features, builder = build_features(frame, use_cache=use_cache)
+
+    squad = None
+    if use_player_data:
+        try:
+            from .player_data import build_squad_strength, squad_lookup
+            squad_df = build_squad_strength(name_map, use_cache=use_cache)
+            squad = squad_lookup(squad_df) if not squad_df.empty else None
+            logger.info("Player layer: %d StatsBomb squad-strength matches", 0 if squad is None else len(squad))
+        except Exception as exc:  # player layer is optional/best-effort
+            logger.warning("Player layer unavailable (%s); continuing without it.", exc)
+
+    features, builder = build_features(frame, use_cache=use_cache, squad_lookup=squad)
     feature_columns = builder.feature_columns_
     logger.info("Using %d features", len(feature_columns))
 
@@ -335,26 +354,28 @@ def train(n_trials: int = config.DEFAULT_OPTUNA_TRIALS, use_cache: bool = True) 
     xgb_params, xgb_model = tune_xgb(splits, n_trials)
     lgb_params, lgb_model = tune_lgb(splits, n_trials)
 
-    # --- poisson ----------------------------------------------------------- #
-    poisson_model = PoissonGoalModel().fit(
-        splits["train"]["X"], splits["train"]["home_goals"], splits["train"]["away_goals"]
-    )
+    # --- Dixon-Coles goal model (leak-free: each fit uses only earlier data) #
+    xi = search_dixon_coles_xi(frame, splits["val"]["meta"], splits["val"]["y"])
+    dc_val = fit_dixon_coles(frame, config.TRAIN_END_YEAR, xi)    # scores val
+    dc_test = fit_dixon_coles(frame, config.VAL_END_YEAR, xi)     # scores test
+    dc_prod = DixonColesModel(xi=xi).fit(frame)                   # for inference
 
-    # --- ensemble weights on validation ------------------------------------ #
+    # --- stacking meta-learner fitted on validation predictions ------------ #
     val_probas = {
         "xgboost": xgb_model.predict_proba(splits["val"]["X"]),
         "lightgbm": lgb_model.predict_proba(splits["val"]["X"]),
-        "poisson": poisson_outcome_probs(poisson_model, splits["val"]["X"]),
+        "dixon_coles": dc_val.predict_proba(splits["val"]["meta"]),
     }
-    weights = optimize_ensemble_weights(val_probas, splits["val"]["y"])
+    stacker = fit_stacker(val_probas, splits["val"]["y"])
 
     # --- test evaluation --------------------------------------------------- #
     test_probas = {
         "xgboost": xgb_model.predict_proba(splits["test"]["X"]),
         "lightgbm": lgb_model.predict_proba(splits["test"]["X"]),
-        "poisson": poisson_outcome_probs(poisson_model, splits["test"]["X"]),
+        "dixon_coles": dc_test.predict_proba(splits["test"]["meta"]),
     }
-    ensemble_test = blend(test_probas, weights)
+    ensemble_test = stack_predict(stacker, test_probas)
+    mean_test = mean_blend(test_probas)
     y_test = splits["test"]["y"]
 
     metrics: dict[str, Any] = {
@@ -362,20 +383,22 @@ def train(n_trials: int = config.DEFAULT_OPTUNA_TRIALS, use_cache: bool = True) 
         "n_train": int(len(splits["train"]["y"])),
         "n_val": int(len(splits["val"]["y"])),
         "n_test": int(len(splits["test"]["y"])),
+        "dixon_coles_xi": xi,
         "test": {
             "xgboost": evaluate(y_test, test_probas["xgboost"]),
             "lightgbm": evaluate(y_test, test_probas["lightgbm"]),
-            "poisson": evaluate(y_test, test_probas["poisson"]),
+            "dixon_coles": evaluate(y_test, test_probas["dixon_coles"]),
+            "ensemble_mean": evaluate(y_test, mean_test),
             "ensemble": evaluate(y_test, ensemble_test),
         },
-        "ensemble_weights": weights,
     }
 
-    # Poisson expected-goals error on the test set.
-    lam_home, lam_away = poisson_model.predict_expected(splits["test"]["X"])
-    metrics["test"]["poisson_goal_mae"] = {
-        "home": float(np.mean(np.abs(lam_home - splits["test"]["home_goals"]))),
-        "away": float(np.mean(np.abs(lam_away - splits["test"]["away_goals"]))),
+    # Dixon-Coles expected-goals error on the test set.
+    dc_lam = np.array([dc_test.predict_expected(r.home_team, r.away_team, r.neutral)
+                       for r in splits["test"]["meta"].itertuples(index=False)])
+    metrics["test"]["goal_mae"] = {
+        "home": float(np.mean(np.abs(dc_lam[:, 0] - splits["test"]["home_goals"]))),
+        "away": float(np.mean(np.abs(dc_lam[:, 1] - splits["test"]["away_goals"]))),
     }
 
     # TimeSeriesSplit CV report.
@@ -394,9 +417,9 @@ def train(n_trials: int = config.DEFAULT_OPTUNA_TRIALS, use_cache: bool = True) 
     joblib.dump(name_map, config.NAME_MAP_PKL)
     joblib.dump(xgb_model, config.XGB_MODEL_PKL)
     joblib.dump(lgb_model, config.LGB_MODEL_PKL)
-    joblib.dump(poisson_model.home_model, config.POISSON_HOME_PKL)
-    joblib.dump(poisson_model.away_model, config.POISSON_AWAY_PKL)
-    joblib.dump(weights, config.ENSEMBLE_WEIGHTS_PKL)
+    joblib.dump(dc_prod, config.DIXON_COLES_PKL)
+    joblib.dump(stacker, config.STACKER_PKL)
+    joblib.dump(list(_STACK_ORDER), config.ENSEMBLE_WEIGHTS_PKL)  # stack input order
     with open(config.METRICS_JSON, "w", encoding="utf-8") as fh:
         json.dump(metrics, fh, indent=2)
 
@@ -409,11 +432,11 @@ def _log_summary(metrics: dict[str, Any]) -> None:
     """Pretty-print the headline test metrics."""
     logger.info("=" * 64)
     logger.info("TEST-SET METRICS (2024+)")
-    logger.info("%-10s %8s %9s %8s %8s", "model", "acc", "logloss", "brier", "roc_auc")
-    for name in ("xgboost", "lightgbm", "poisson", "ensemble"):
+    logger.info("%-13s %8s %9s %8s %8s", "model", "acc", "logloss", "brier", "roc_auc")
+    for name in ("xgboost", "lightgbm", "dixon_coles", "ensemble_mean", "ensemble"):
         m = metrics["test"][name]
         logger.info(
-            "%-10s %8.4f %9.4f %8.4f %8.4f",
+            "%-13s %8.4f %9.4f %8.4f %8.4f",
             name, m["accuracy"], m["log_loss"], m["brier_score"], m["roc_auc_ovr_macro"],
         )
     logger.info("=" * 64)
@@ -426,10 +449,12 @@ def main() -> None:
                         help="Number of Optuna trials per classifier (default: 100).")
     parser.add_argument("--no-cache", action="store_true", help="Ignore cached preprocessing/features.")
     parser.add_argument("--quick", action="store_true", help="Quick run with 10 trials (for smoke testing).")
+    parser.add_argument("--no-player-data", action="store_true",
+                        help="Skip the StatsBomb squad-strength player layer.")
     args = parser.parse_args()
 
     n_trials = 10 if args.quick else args.trials
-    train(n_trials=n_trials, use_cache=not args.no_cache)
+    train(n_trials=n_trials, use_cache=not args.no_cache, use_player_data=not args.no_player_data)
 
 
 if __name__ == "__main__":
