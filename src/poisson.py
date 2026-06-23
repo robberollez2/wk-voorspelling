@@ -1,74 +1,17 @@
-"""Poisson goal model and scoreline-probability utilities.
+"""Scoreline-probability utilities (shared by the Dixon-Coles model).
 
-Two :class:`~sklearn.linear_model.PoissonRegressor` models (wrapped in scaling
-pipelines) estimate the expected number of goals for the home and away side.
-From those two rate parameters we build a full independent-Poisson scoreline
-matrix, which yields:
-
-* the most likely scoreline and the top-N scorelines,
-* an independent home/draw/away probability estimate (used in the ensemble).
+These helpers turn a pair of expected-goal rates into a full scoreline
+probability matrix and derive the most likely scoreline, the top-N scorelines
+and the home/draw/away outcome probabilities. The goal-rate estimation itself
+lives in :mod:`src.dixon_coles`.
 """
 
 from __future__ import annotations
 
 import numpy as np
-import pandas as pd
 from scipy.stats import poisson
-from sklearn.linear_model import PoissonRegressor
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
 
 from . import config
-from .config import get_logger
-
-logger = get_logger(__name__)
-
-
-class PoissonGoalModel:
-    """Predicts expected home/away goals with two Poisson regressions."""
-
-    def __init__(self, alpha: float = 1e-3, max_iter: int = 1000) -> None:
-        self.alpha = alpha
-        self.max_iter = max_iter
-        self.home_model: Pipeline = self._make_pipeline()
-        self.away_model: Pipeline = self._make_pipeline()
-
-    def _make_pipeline(self) -> Pipeline:
-        return Pipeline(
-            steps=[
-                ("scaler", StandardScaler()),
-                (
-                    "poisson",
-                    PoissonRegressor(alpha=self.alpha, max_iter=self.max_iter, tol=1e-7),
-                ),
-            ]
-        )
-
-    def fit(
-        self,
-        X: pd.DataFrame,
-        home_goals: pd.Series | np.ndarray,
-        away_goals: pd.Series | np.ndarray,
-    ) -> "PoissonGoalModel":
-        """Fit both goal regressions.
-
-        Args:
-            X: Feature matrix.
-            home_goals: Observed home goals (target for the home model).
-            away_goals: Observed away goals (target for the away model).
-        """
-        logger.info("Fitting Poisson goal models on %d rows", len(X))
-        self.home_model.fit(X, np.asarray(home_goals, dtype=float))
-        self.away_model.fit(X, np.asarray(away_goals, dtype=float))
-        return self
-
-    def predict_expected(self, X: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
-        """Return clipped expected ``(home_goals, away_goals)`` arrays."""
-        lam_home = self.home_model.predict(X)
-        lam_away = self.away_model.predict(X)
-        lam_home = np.clip(lam_home, config.MIN_EXPECTED_GOALS, config.MAX_EXPECTED_GOALS)
-        lam_away = np.clip(lam_away, config.MIN_EXPECTED_GOALS, config.MAX_EXPECTED_GOALS)
-        return lam_home, lam_away
 
 
 # --------------------------------------------------------------------------- #

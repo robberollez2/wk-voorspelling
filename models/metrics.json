@@ -1,66 +1,67 @@
 {
-  "n_features": 87,
-  "n_train": 57221,
+  "n_features": 86,
+  "n_train": 7730,
   "n_val": 4239,
-  "n_test": 3696,
+  "n_test": 3721,
   "dixon_coles_xi": 0.0004,
+  "dixon_coles_alpha": 3e-05,
   "test": {
     "xgboost": {
-      "accuracy": 0.5854978354978355,
-      "log_loss": 0.8804534673690796,
-      "brier_score": 0.5208613276481628,
-      "roc_auc_ovr_macro": 0.7410250906205639
+      "accuracy": 0.5791453910239183,
+      "log_loss": 0.8991525769233704,
+      "brier_score": 0.5300970673561096,
+      "roc_auc_ovr_macro": 0.7317596012330082
     },
     "lightgbm": {
-      "accuracy": 0.5865800865800865,
-      "log_loss": 0.8829346265111878,
-      "brier_score": 0.5219699815135519,
-      "roc_auc_ovr_macro": 0.7391170014500682
+      "accuracy": 0.5780704111797904,
+      "log_loss": 0.9037955319546984,
+      "brier_score": 0.5327635245736126,
+      "roc_auc_ovr_macro": 0.7293553702420515
     },
     "dixon_coles": {
-      "accuracy": 0.5768398268398268,
-      "log_loss": 0.9018900977680728,
-      "brier_score": 0.5311761364966062,
-      "roc_auc_ovr_macro": 0.7421841729047847
+      "accuracy": 0.582907820478366,
+      "log_loss": 0.8741192679133063,
+      "brier_score": 0.5160965151887152,
+      "roc_auc_ovr_macro": 0.7505294536657221
     },
     "ensemble_mean": {
-      "accuracy": 0.5865800865800865,
-      "log_loss": 0.8814492173617212,
-      "brier_score": 0.519799871198776,
-      "roc_auc_ovr_macro": 0.74437138376301
+      "accuracy": 0.5858640150497179,
+      "log_loss": 0.8811120223373322,
+      "brier_score": 0.5188901471191121,
+      "roc_auc_ovr_macro": 0.7465582910910142
     },
     "ensemble": {
-      "accuracy": 0.5852272727272727,
-      "log_loss": 0.8776115355872932,
-      "brier_score": 0.5193902456356342,
-      "roc_auc_ovr_macro": 0.7450640599393633
+      "accuracy": 0.5901639344262295,
+      "log_loss": 0.8745491610210345,
+      "brier_score": 0.5165839501852453,
+      "roc_auc_ovr_macro": 0.7472885155867376
     },
     "goal_mae": {
-      "home": 0.9969687429039333,
-      "away": 0.8742155898149642
+      "home": 0.9625003027231864,
+      "away": 0.8495571171824854
     }
   },
   "time_series_cv": {
-    "cv_log_loss_mean": 0.8998725175857544,
-    "cv_log_loss_std": 0.014030290852340902,
-    "cv_accuracy_mean": 0.5811584860484391,
-    "cv_accuracy_std": 0.0072094736749756935
+    "cv_log_loss_mean": 0.9084801077842712,
+    "cv_log_loss_std": 0.03493067393713725,
+    "cv_accuracy_mean": 0.5769024856596557,
+    "cv_accuracy_std": 0.024917824281890592
   },
   "shap_top_features": {
-    "elo_expected_home": 0.4084114730358124,
-    "neutral": 0.061973292380571365,
-    "elo_difference": 0.06096383184194565,
-    "away_matches_played": 0.05345102399587631,
-    "tournament_importance": 0.028387481346726418,
-    "home_matches_played": 0.025384709239006042,
-    "home_goals_scored_last_20": 0.017453251406550407,
-    "weighted_points_diff": 0.017323175445199013,
-    "away_losses_last_20": 0.015865523368120193,
-    "away_elo": 0.015178493224084377,
-    "h2h_goal_difference": 0.014559537172317505,
-    "home_goals_conceded_last_10": 0.014279145747423172,
-    "away_weighted_goal_diff": 0.013746500946581364,
-    "home_weighted_goal_diff": 0.013181855902075768,
-    "home_goals_conceded_last_20": 0.012201063334941864
+    "elo_expected_home": 0.24031339585781097,
+    "common_opp_goaldiff_diff": 0.10103629529476166,
+    "away_matches_played": 0.074365995824337,
+    "elo_difference": 0.06232127547264099,
+    "neutral": 0.03200850635766983,
+    "home_matches_played": 0.0221133753657341,
+    "away_goal_difference_last_5": 0.01787836290895939,
+    "tournament_importance": 0.01741216890513897,
+    "common_opp_points_diff": 0.017382947728037834,
+    "h2h_goal_difference": 0.014164764434099197,
+    "away_goals_conceded_last_5": 0.01293078064918518,
+    "home_elo_momentum": 0.01277738343924284,
+    "away_goals_scored_last_20": 0.012737256474792957,
+    "form_goal_diff_diff_10": 0.011964734643697739,
+    "away_weighted_goal_diff": 0.01155554223805666
   }
 }

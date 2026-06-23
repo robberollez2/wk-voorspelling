@@ -202,23 +202,32 @@ def tune_lgb(splits: dict[str, Any], n_trials: int) -> tuple[dict[str, Any], lgb
 # --------------------------------------------------------------------------- #
 # Dixon-Coles fitting (with a small time-decay search)
 # --------------------------------------------------------------------------- #
-def fit_dixon_coles(frame: pd.DataFrame, cutoff_year: int, xi: float) -> DixonColesModel:
+def fit_dixon_coles(frame: pd.DataFrame, cutoff_year: int, xi: float, alpha: float) -> DixonColesModel:
     """Fit a Dixon-Coles model on all matches up to (and including) a year."""
     train = frame[frame["year"] <= cutoff_year]
-    return DixonColesModel(xi=xi).fit(train)
+    return DixonColesModel(xi=xi, alpha=alpha).fit(train)
 
 
-def search_dixon_coles_xi(frame: pd.DataFrame, val_meta: pd.DataFrame, y_val: np.ndarray) -> float:
-    """Pick the time-decay rate minimising validation log loss."""
-    best_xi, best_loss = 0.0, np.inf
-    for xi in (0.0, 0.0004, 0.00076, 0.0012, 0.002):
-        model = fit_dixon_coles(frame, config.TRAIN_END_YEAR, xi)
-        proba = model.predict_proba(val_meta)
-        loss = log_loss(y_val, proba, labels=_LABELS)
-        if loss < best_loss:
-            best_loss, best_xi = loss, xi
-    logger.info("Dixon-Coles best xi=%.5f (val log loss %.4f)", best_xi, best_loss)
-    return best_xi
+def search_dixon_coles_params(
+    frame: pd.DataFrame, val_meta: pd.DataFrame, y_val: np.ndarray
+) -> tuple[float, float]:
+    """Pick the time-decay ``xi`` and ridge ``alpha`` minimising val log loss.
+
+    A smaller ``alpha`` lets the attack/defense strengths spread further apart,
+    which makes strong-vs-weak fixtures (e.g. Germany vs Cape Verde) more
+    decisive and realistic; it is searched here rather than fixed so the data
+    chooses how much shrinkage is appropriate.
+    """
+    best_params, best_loss = (0.0004, 1e-3), np.inf
+    for xi in (0.0, 0.0004, 0.00076, 0.0012):
+        for alpha in (1e-3, 3e-4, 1e-4, 5e-5, 3e-5, 1e-5):
+            model = fit_dixon_coles(frame, config.TRAIN_END_YEAR, xi, alpha)
+            loss = log_loss(y_val, model.predict_proba(val_meta), labels=_LABELS)
+            if loss < best_loss:
+                best_loss, best_params = loss, (xi, alpha)
+    logger.info("Dixon-Coles best xi=%.5f alpha=%.0e (val log loss %.4f)",
+                best_params[0], best_params[1], best_loss)
+    return best_params
 
 
 # --------------------------------------------------------------------------- #
@@ -328,23 +337,12 @@ def compute_shap(model: xgb.XGBClassifier, X: pd.DataFrame, feature_columns: lis
 def train(
     n_trials: int = config.DEFAULT_OPTUNA_TRIALS,
     use_cache: bool = True,
-    use_player_data: bool = True,
 ) -> dict[str, Any]:
     """Run the end-to-end training pipeline and persist all artifacts."""
     config.ensure_dirs()
     frame, name_map = preprocess(use_cache=use_cache)
 
-    squad = None
-    if use_player_data:
-        try:
-            from .player_data import build_squad_strength, squad_lookup
-            squad_df = build_squad_strength(name_map, use_cache=use_cache)
-            squad = squad_lookup(squad_df) if not squad_df.empty else None
-            logger.info("Player layer: %d StatsBomb squad-strength matches", 0 if squad is None else len(squad))
-        except Exception as exc:  # player layer is optional/best-effort
-            logger.warning("Player layer unavailable (%s); continuing without it.", exc)
-
-    features, builder = build_features(frame, use_cache=use_cache, squad_lookup=squad)
+    features, builder = build_features(frame, use_cache=use_cache)
     feature_columns = builder.feature_columns_
     logger.info("Using %d features", len(feature_columns))
 
@@ -355,10 +353,10 @@ def train(
     lgb_params, lgb_model = tune_lgb(splits, n_trials)
 
     # --- Dixon-Coles goal model (leak-free: each fit uses only earlier data) #
-    xi = search_dixon_coles_xi(frame, splits["val"]["meta"], splits["val"]["y"])
-    dc_val = fit_dixon_coles(frame, config.TRAIN_END_YEAR, xi)    # scores val
-    dc_test = fit_dixon_coles(frame, config.VAL_END_YEAR, xi)     # scores test
-    dc_prod = DixonColesModel(xi=xi).fit(frame)                   # for inference
+    xi, dc_alpha = search_dixon_coles_params(frame, splits["val"]["meta"], splits["val"]["y"])
+    dc_val = fit_dixon_coles(frame, config.TRAIN_END_YEAR, xi, dc_alpha)   # scores val
+    dc_test = fit_dixon_coles(frame, config.VAL_END_YEAR, xi, dc_alpha)    # scores test
+    dc_prod = DixonColesModel(xi=xi, alpha=dc_alpha).fit(frame)            # for inference
 
     # --- stacking meta-learner fitted on validation predictions ------------ #
     val_probas = {
@@ -384,6 +382,7 @@ def train(
         "n_val": int(len(splits["val"]["y"])),
         "n_test": int(len(splits["test"]["y"])),
         "dixon_coles_xi": xi,
+        "dixon_coles_alpha": dc_alpha,
         "test": {
             "xgboost": evaluate(y_test, test_probas["xgboost"]),
             "lightgbm": evaluate(y_test, test_probas["lightgbm"]),
@@ -449,12 +448,10 @@ def main() -> None:
                         help="Number of Optuna trials per classifier (default: 100).")
     parser.add_argument("--no-cache", action="store_true", help="Ignore cached preprocessing/features.")
     parser.add_argument("--quick", action="store_true", help="Quick run with 10 trials (for smoke testing).")
-    parser.add_argument("--no-player-data", action="store_true",
-                        help="Skip the StatsBomb squad-strength player layer.")
     args = parser.parse_args()
 
     n_trials = 10 if args.quick else args.trials
-    train(n_trials=n_trials, use_cache=not args.no_cache, use_player_data=not args.no_player_data)
+    train(n_trials=n_trials, use_cache=not args.no_cache)
 
 
 if __name__ == "__main__":

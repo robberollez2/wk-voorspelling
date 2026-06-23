@@ -12,8 +12,8 @@ It combines an **XGBoost** classifier, a **LightGBM** classifier and a
 **Dixon-Coles** attack/defense goal model through a logistic-regression
 **stacking** meta-learner, on top of leak-free temporal features (Elo ratings,
 rolling form, head-to-head, rest/fatigue, venue-specific form, Elo momentum,
-tournament importance) plus an optional **StatsBomb squad-strength** player
-layer.
+a **common-opponents** transitive-strength comparison and tournament
+importance).
 
 ```
 Belgium vs Netherlands
@@ -48,14 +48,14 @@ Top 5 outcomes:
 | **Fatigue & momentum** | Rest days since the last match, matches-played experience, venue-specific (home/away) form, win/loss streaks and Elo momentum. |
 | **Head-to-head** | Directional H2H record and goal difference over the last **10 years**. |
 | **Tournament importance** | Raw tournaments are bucketed (Friendly, Nations League, World Cup (Q), Continental (Q), Confederations Cup, Continental Championship, …) and one-hot encoded. |
+| **Common opponents** | Transitive strength: for shared recent opponents (within 4 years), it compares each side's average goal difference and points — e.g. *France vs Senegal* looks at how each fared against the teams they have both faced. |
 | **Dixon-Coles goal model** | Team attack/defense strengths with home advantage, **exponential time decay** and the low-score (`rho`) correction → expected goals and a corrected scoreline matrix (0-0 … 10-10). |
-| **Player layer** | Optional **StatsBomb** squad-strength feature built from line-ups of covered men's tournaments (World Cups, Euro 2020/24, Copa 2024, AFCON 2023), with a neutral fallback elsewhere. |
 | **Stacking ensemble** | A multinomial logistic-regression meta-learner combines **and calibrates** the three models (beats fixed weights on log loss / Brier). |
 | **Hyperparameter tuning** | **Optuna** (default 100 trials per classifier) optimising **log loss**; the Dixon-Coles time-decay is searched too. |
 | **Time-aware validation** | No random splits. Train ≤ 2020, validate 2021-2023, test 2024+, plus a `TimeSeriesSplit` report. Every Dixon-Coles fit only sees matches before the split it scores. |
 | **Explainability** | **SHAP** global feature importances (saved as PNG + table). |
 | **Interfaces** | A **Streamlit** web app and an interactive **CLI**. |
-| **Engineering** | Type hints, logging, joblib persistence, parquet caching, vectorized pandas, test suite, modular player-data layer. |
+| **Engineering** | Type hints, logging, joblib persistence, parquet caching, vectorized pandas, test suite, modular feature layer. |
 
 ---
 
@@ -73,7 +73,6 @@ football_ai/
 │   ├── elo.py                   # Elo rating system
 │   ├── features.py              # leak-free FeatureBuilder (training + inference)
 │   ├── dixon_coles.py           # Dixon-Coles attack/defense goal model
-│   ├── player_data.py           # StatsBomb squad-strength player layer
 │   ├── poisson.py               # scoreline maths helpers
 │   ├── train.py                 # Optuna tuning, stacking ensemble, metrics, SHAP
 │   └── predict.py               # Predictor class + interactive CLI
@@ -124,14 +123,10 @@ Training writes everything to `models/`:
 
 ```
 xgb_model.joblib  lgb_model.joblib  dixon_coles.joblib  stacker.joblib
-feature_builder.joblib  feature_list.joblib  name_map.joblib
-metrics.json  shap_summary.png  shap_summary.joblib
-preprocessed.parquet  feature_matrix.parquet  squad_strength.parquet
+ensemble_weights.joblib  feature_builder.joblib  feature_list.joblib
+name_map.joblib  metrics.json  shap_summary.png  shap_summary.joblib
+preprocessed.parquet  feature_matrix.parquet
 ```
-
-> The first run fetches StatsBomb line-ups once (cached to
-> `squad_strength.parquet`). Use `python -m src.train --no-player-data` to skip
-> the player layer (e.g. offline).
 
 ### 2. Predict from the terminal
 
@@ -204,17 +199,17 @@ this gives `λ_home`, `λ_away` and a corrected matrix
 scorelines. Because the home term vanishes on neutral ground, the model is
 naturally **immune to the neutral-labelling leak** described below.
 
-### Player layer (StatsBomb)
+### Common opponents (transitive strength)
 
-`player_data.py` fetches line-ups for covered men's international tournaments
-from StatsBomb open-data and maintains a per-player result rating; a team's
-**squad strength** for a match is the leak-free mean rating of its starting XI.
-FBref is blocked to automated access and Transfermarkt needs fragile scraping,
-so StatsBomb is the practical free source here — it covers ≈3% of matches (the
-marquee tournaments), and every other match (and any future fixture without a
-supplied line-up) falls back to a neutral default plus a `squad_data_available`
-flag. The feature therefore sharpens World Cup / Euro / Copa / AFCON predictions
-without affecting the rest.
+When two teams rarely meet, their shared opponents are an informative bridge.
+For a fixture (e.g. *France vs Senegal*) the builder collects every third team
+both sides have faced within the last `COMMON_OPP_YEARS` (4) years, and for each
+shared opponent compares the home team's average goal difference and points
+against it with the away team's. The averaged gaps become three leak-free
+features (`common_opp_count`, `common_opp_goaldiff_diff`,
+`common_opp_points_diff`). A positive value means the home team performed better
+against the common field — exactly the "how did Senegal do against the teams
+France recently played?" intuition, made symmetric.
 
 ### Validation & metrics
 
@@ -227,65 +222,53 @@ See `models/metrics.json` after training.
 
 ## Results
 
-Hold-out **test set (2024+, 3,696 matches incl. mirrored neutral rows)** from a
-full 100-trial run (87 features):
+Hold-out **test set (2024+, 3,721 matches incl. mirrored neutral rows)** from a
+full 100-trial run (86 features, dataset 2014-2026):
 
 | Model | Accuracy | Log Loss | Brier | ROC AUC (OvR) |
 | --- | --- | --- | --- | --- |
-| XGBoost | 0.586 | 0.881 | 0.521 | 0.741 |
-| LightGBM | 0.587 | 0.883 | 0.522 | 0.739 |
-| Dixon-Coles | 0.577 | 0.902 | 0.531 | 0.742 |
-| Equal-weight mean | 0.587 | 0.881 | 0.520 | 0.744 |
-| **Stacked ensemble** | **0.585** | **0.878** | **0.519** | **0.745** |
+| XGBoost | 0.579 | 0.900 | 0.530 | 0.732 |
+| LightGBM | 0.581 | 0.902 | 0.532 | 0.730 |
+| Dixon-Coles | 0.579 | 0.902 | 0.531 | 0.741 |
+| Equal-weight mean | 0.581 | 0.893 | 0.526 | 0.739 |
+| **Stacked ensemble** | **0.578** | **0.887** | **0.524** | **0.739** |
 
-- **TimeSeriesSplit CV:** log loss 0.900 ± 0.014, accuracy 0.581 ± 0.007
-- **Dixon-Coles expected-goals MAE:** home 1.00, away 0.87
-- **Top SHAP features:** `elo_expected_home` ≫ `neutral` ≈ `elo_difference` >
-  `away_matches_played` (experience) > `tournament_importance` >
-  `home_matches_played` > recent-form / weighted-form features
+- **TimeSeriesSplit CV:** log loss 0.909 ± 0.034, accuracy 0.576 ± 0.025
+- **Dixon-Coles expected-goals MAE:** home 0.99, away 0.87
+- **Top SHAP features:** `elo_expected_home` ≫ **`common_opp_goaldiff_diff`**
+  (the common-opponents signal — 2nd overall) > `away_matches_played`
+  (experience) > `elo_difference` > `home_matches_played` > `neutral` >
+  `tournament_importance` > `common_opp_points_diff` > recent-form features.
 
-**Improvement vs. the previous baseline** (XGB+LGB+generic-Poisson, fixed
-weights, 70 features):
-
-| Metric | Baseline | This model | Δ |
-| --- | --- | --- | --- |
-| Log Loss | 0.8815 | **0.8776** | −0.0039 |
-| Brier | 0.5212 | **0.5194** | −0.0018 |
-| ROC AUC | 0.743 | **0.745** | +0.002 |
-| Accuracy | 0.581 | **0.585** | +0.004 |
+The **stacking meta-learner** gives the best calibration: it cuts log loss from
+~0.90 (each base model) to **0.887** and Brier to **0.524**, also beating the
+equal-weight mean (0.893). The user-requested **common-opponents** feature turned
+out to be the **2nd most important feature** in the whole model.
 
 > **A note on accuracy.** International match outcomes have a hard predictive
-> ceiling — even bookmakers land around 55-60% three-class accuracy. The gains
-> here are therefore mostly in **calibration** (log loss / Brier), **ranking**
-> (ROC AUC) and a much stronger goal/scoreline model (Dixon-Coles), rather than a
-> dramatic accuracy jump, which would not be honestly achievable. A naive model
-> that keeps the raw neutral labelling reports a *misleadingly* higher ~66%
-> accuracy by exploiting the "winner is listed as home" leak in neutral
-> matches — which carries no real predictive value. See *Notes & assumptions*.
+> ceiling — even bookmakers land around 55-60% three-class accuracy, because a
+> large share of results (especially draws and one-goal games) is genuinely
+> random. The gains from a better model therefore show up mostly in
+> **calibration** (log loss / Brier), **ranking** (ROC AUC) and a much stronger
+> goal/scoreline model (Dixon-Coles), rather than a dramatic accuracy jump, which
+> would not be honestly achievable. A naive model that keeps the raw neutral
+> labelling reports a *misleadingly* higher ~66% accuracy by exploiting the
+> "winner is listed as home" leak in neutral matches — which carries no real
+> predictive value. See *Notes & assumptions*.
 
-## Player data & extending the layer
+## Extending the feature set
 
-The StatsBomb squad-strength layer (`src/player_data.py`) is already wired in:
-it builds a leak-free per-match squad strength and merges it as features
-(`home_squad_strength`, `away_squad_strength`, `squad_strength_diff`,
-`squad_data_available`). Because FBref blocks automated access and StatsBomb
-open-data only covers a handful of men's tournaments, the signal is **sparse by
-design** — it improves predictions for the covered marquee fixtures and falls
-back to a neutral default everywhere else, so it cannot (and is not claimed to)
-move the global test accuracy much.
+All features are produced by a single `FeatureBuilder` that owns the leak-free
+state. To add a new signal (e.g. richer player/availability data, market values,
+xG):
 
-To add richer player signals (full line-ups, availability, market values, xG per
-player) the pipeline only needs:
+1. add any extra state to `FeatureBuilder._update_state`,
+2. add a few lines to `FeatureBuilder._compute_features` (new keys are picked up
+   by `feature_columns_` automatically),
+3. retrain.
 
-1. a loader that yields a leak-free `(date, {teamA, teamB}) -> {team: value}`
-   lookup (mirroring `player_data.squad_lookup`),
-2. a few lines in `FeatureBuilder._squad_stats` / `_compute_features` (new
-   features are picked up by `feature_columns_` automatically),
-3. a retrain.
-
-No model, ensemble or interface code needs to change — everything consumes
-`feature_columns_` generically. Supplying a real expected line-up at inference
-time would let the squad features fire for future fixtures too.
+No model, ensemble or interface code needs to change — XGBoost, LightGBM, the
+stacker and both interfaces consume `feature_columns_` generically.
 
 ---
 

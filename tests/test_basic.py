@@ -120,10 +120,32 @@ def test_feature_builder_no_nan_and_columns():
     assert not feats[builder.feature_columns_].isna().any().any()
     one = builder.transform_one("A", "B", pd.Timestamp("2000-06-01"), False, "Friendly")
     assert list(one.columns) == builder.feature_columns_
-    # Squad features exist and default to neutral when no StatsBomb lookup.
-    for col in ("home_squad_strength", "squad_strength_diff", "squad_data_available"):
+    # Common-opponents features exist (the transitive strength comparison).
+    for col in ("common_opp_count", "common_opp_goaldiff_diff", "common_opp_points_diff"):
         assert col in builder.feature_columns_
-    assert (feats["squad_data_available"] == 0).all()
+
+
+def test_common_opponents_feature():
+    # A and B have never met, but both have played C -> C is a common opponent.
+    rows = [
+        ("2020-01-01", "A", "C", 3, 0, False),  # A beats C heavily
+        ("2020-02-01", "C", "B", 2, 0, False),  # C beats B
+        ("2020-03-01", "A", "B", 1, 0, False),  # the fixture of interest
+    ]
+    df = pd.DataFrame(rows, columns=["date", "home_team", "away_team", "home_score", "away_score", "neutral"])
+    df["date"] = pd.to_datetime(df["date"])
+    df["tournament_category"] = "Friendly"
+    df["tournament_importance"] = tournament_importance_weight("Friendly")
+    df["year"] = df["date"].dt.year
+    df["month"] = df["date"].dt.month
+    df["day_of_week"] = df["date"].dt.dayofweek
+    df["result"] = np.where(df.home_score > df.away_score, 2, np.where(df.home_score == df.away_score, 1, 0))
+
+    builder = FeatureBuilder()
+    feats = builder.fit_transform(df, use_cache=False, mirror_neutral=False)
+    a_vs_b = feats.iloc[-1]  # the A vs B match
+    assert a_vs_b["common_opp_count"] == 1.0          # C is the shared opponent
+    assert a_vs_b["common_opp_goaldiff_diff"] > 0      # A did better vs C than B did
 
 
 def test_dixon_coles_model():

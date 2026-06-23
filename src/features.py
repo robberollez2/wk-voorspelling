@@ -40,9 +40,12 @@ from .preprocess import (
 
 logger = get_logger(__name__)
 
-_MAX_LOG = max(max(config.FORM_WINDOWS), config.RECENCY_WINDOW)
+# The rolling log must be long enough for form, recency *and* the
+# common-opponents scan, whichever needs the most history.
+_MAX_LOG = max(max(config.FORM_WINDOWS), config.RECENCY_WINDOW, config.COMMON_OPP_WINDOW)
 _DECAY_PER_STEP = 0.5 ** (1.0 / config.RECENCY_HALFLIFE)
 _H2H_DELTA = pd.Timedelta(days=int(config.H2H_YEARS * 365.25))
+_COMMON_OPP_DELTA = pd.Timedelta(days=int(config.COMMON_OPP_YEARS * 365.25))
 
 
 _VENUE_WINDOW = 10  # matches used for venue-specific (home/away) form
@@ -52,8 +55,9 @@ _VENUE_WINDOW = 10  # matches used for venue-specific (home/away) form
 class _TeamState:
     """Bounded rolling state for a single team."""
 
-    # Each entry: (timestamp, goals_for, goals_against, outcome) where outcome
-    # is 2=win, 1=draw, 0=loss from the team's own perspective.
+    # Each entry: (timestamp, opponent, goals_for, goals_against, outcome) where
+    # outcome is 2=win, 1=draw, 0=loss from the team's own perspective. The
+    # opponent name powers the common-opponents feature.
     log: deque = field(default_factory=lambda: deque(maxlen=_MAX_LOG))
     # Elo rating after each match (for momentum).
     elo_history: deque = field(default_factory=lambda: deque(maxlen=_MAX_LOG))
@@ -80,8 +84,6 @@ class FeatureBuilder:
         self.elo = EloRatingSystem()
         self._teams: dict[str, _TeamState] = {}
         self._h2h: dict[tuple[str, str], list[tuple]] = {}
-        # Optional StatsBomb squad-strength lookup: (date_str, t1, t2) -> {team: strength}.
-        self._squad_lookup: dict[tuple[str, str, str], dict[str, float]] = {}
         self.feature_columns_: list[str] = []
         self.last_date_: pd.Timestamp | None = None
         self.teams_: list[str] = []
@@ -111,7 +113,7 @@ class FeatureBuilder:
         for window in config.FORM_WINDOWS:
             recent = entries[-window:]
             wins = draws = losses = gf = ga = 0
-            for _, goals_for, goals_against, outcome in recent:
+            for _ts, _opp, goals_for, goals_against, outcome in recent:
                 gf += goals_for
                 ga += goals_against
                 if outcome == 2:
@@ -143,7 +145,7 @@ class FeatureBuilder:
         total_w = 0.0
         w_points = 0.0
         w_gd = 0.0
-        for idx, (_, goals_for, goals_against, outcome) in enumerate(entries):
+        for idx, (_ts, _opp, goals_for, goals_against, outcome) in enumerate(entries):
             distance = (m - 1) - idx  # 0 == most recent
             weight = _DECAY_PER_STEP ** distance
             points = 3.0 if outcome == 2 else 1.0 if outcome == 1 else 0.0
@@ -191,7 +193,7 @@ class FeatureBuilder:
         entries = list(log)
         if not entries:
             return 0.0
-        last = entries[-1][3]
+        last = entries[-1][-1]  # outcome is the final tuple element
         if last == 1:  # draw breaks both streaks
             return 0.0
         target = last
@@ -231,27 +233,52 @@ class FeatureBuilder:
             f"{prefix}_elo_momentum": float(momentum),
         }
 
-    def _squad_stats(self, home: str, away: str, date: pd.Timestamp) -> dict[str, float]:
-        """StatsBomb squad-strength features (neutral default when unavailable)."""
-        lookup = getattr(self, "_squad_lookup", None)  # tolerate older pickles
-        if lookup:
-            t1, t2 = (home, away) if home <= away else (away, home)
-            key = (pd.Timestamp(date).strftime("%Y-%m-%d"), t1, t2)
-            squad = lookup.get(key)
-            if squad is not None:
-                hs = squad.get(home, 0.0)
-                as_ = squad.get(away, 0.0)
-                return {
-                    "home_squad_strength": hs,
-                    "away_squad_strength": as_,
-                    "squad_strength_diff": hs - as_,
-                    "squad_data_available": 1.0,
-                }
+    def _common_opponents_stats(
+        self, home: str, away: str, date: pd.Timestamp
+    ) -> dict[str, float]:
+        """Transitive strength via shared recent opponents.
+
+        Implements the idea: "if France plays Senegal, look at how each team has
+        recently fared against the opponents they have *in common*". For every
+        third team both sides have faced within :data:`config.COMMON_OPP_YEARS`
+        years, compare the home team's average goal difference / points against
+        that opponent with the away team's, then average the gaps. A positive
+        value means the home team performed better against the shared field.
+        """
+        cutoff = date - _COMMON_OPP_DELTA
+
+        def perf_by_opponent(team: str) -> dict[str, tuple[float, float, int]]:
+            agg: dict[str, list[tuple[int, int]]] = {}
+            for ts, opp, gf, ga, outcome in self._team(team).log:
+                if ts < cutoff:
+                    continue
+                points = 3 if outcome == 2 else 1 if outcome == 1 else 0
+                agg.setdefault(opp, []).append((gf - ga, points))
+            return {
+                opp: (
+                    sum(g for g, _ in rows) / len(rows),
+                    sum(p for _, p in rows) / len(rows),
+                    len(rows),
+                )
+                for opp, rows in agg.items()
+            }
+
+        home_perf = perf_by_opponent(home)
+        away_perf = perf_by_opponent(away)
+        common = (set(home_perf) & set(away_perf)) - {home, away}
+        if not common:
+            return {
+                "common_opp_count": 0.0,
+                "common_opp_goaldiff_diff": 0.0,
+                "common_opp_points_diff": 0.0,
+            }
+
+        gd_gaps = [home_perf[o][0] - away_perf[o][0] for o in common]
+        pts_gaps = [home_perf[o][1] - away_perf[o][1] for o in common]
         return {
-            "home_squad_strength": 0.0,
-            "away_squad_strength": 0.0,
-            "squad_strength_diff": 0.0,
-            "squad_data_available": 0.0,
+            "common_opp_count": float(len(common)),
+            "common_opp_goaldiff_diff": float(np.mean(gd_gaps)),
+            "common_opp_points_diff": float(np.mean(pts_gaps)),
         }
 
     def _compute_features(
@@ -305,8 +332,8 @@ class FeatureBuilder:
         feats["elo_momentum_diff"] = home_dyn["home_elo_momentum"] - away_dyn["away_elo_momentum"]
         feats["venue_form_diff"] = home_dyn["home_venue_form"] - away_dyn["away_venue_form"]
 
-        # Player layer: StatsBomb squad strength (neutral default when absent).
-        feats.update(self._squad_stats(home, away, date))
+        # Common-opponents transitive strength comparison.
+        feats.update(self._common_opponents_stats(home, away, date))
 
         # Context features.
         feats["neutral"] = 1.0 if neutral else 0.0
@@ -342,8 +369,8 @@ class FeatureBuilder:
 
         home_state = self._team(home)
         away_state = self._team(away)
-        home_state.log.append((date, home_score, away_score, home_outcome))
-        away_state.log.append((date, away_score, home_score, away_outcome))
+        home_state.log.append((date, away, home_score, away_score, home_outcome))
+        away_state.log.append((date, home, away_score, home_score, away_outcome))
         self._h2h.setdefault(self._pair_key(home, away), []).append(
             (date, home, away, home_score, away_score)
         )
@@ -373,7 +400,6 @@ class FeatureBuilder:
         use_cache: bool = True,
         cache_path: Path | str = config.FEATURES_PARQUET,
         mirror_neutral: bool = True,
-        squad_lookup: dict | None = None,
     ) -> pd.DataFrame:
         """Fit the builder on the full history and return the feature matrix.
 
@@ -396,8 +422,6 @@ class FeatureBuilder:
             ``home_score``, ``away_score`` and ``is_mirror``.
         """
         cache_path = Path(cache_path)
-        if squad_lookup is not None:
-            self._squad_lookup = squad_lookup
         # State is always (re)built because it is required for inference and is
         # cheap; the expensive-to-recompute matrix itself is what we cache.
         rows: list[dict[str, float]] = []
@@ -518,11 +542,10 @@ def build_features(
     df: pd.DataFrame,
     *,
     use_cache: bool = True,
-    squad_lookup: dict | None = None,
 ) -> tuple[pd.DataFrame, FeatureBuilder]:
     """Convenience wrapper returning ``(feature_matrix, fitted_builder)``."""
     builder = FeatureBuilder()
-    features = builder.fit_transform(df, use_cache=use_cache, squad_lookup=squad_lookup)
+    features = builder.fit_transform(df, use_cache=use_cache)
     return features, builder
 
 

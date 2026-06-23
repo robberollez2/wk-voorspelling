@@ -32,11 +32,10 @@ NAME_MAP_PKL: Path = MODELS_DIR / "name_map.joblib"
 
 XGB_MODEL_PKL: Path = MODELS_DIR / "xgb_model.joblib"
 LGB_MODEL_PKL: Path = MODELS_DIR / "lgb_model.joblib"
-POISSON_HOME_PKL: Path = MODELS_DIR / "poisson_home.joblib"
-POISSON_AWAY_PKL: Path = MODELS_DIR / "poisson_away.joblib"
 DIXON_COLES_PKL: Path = MODELS_DIR / "dixon_coles.joblib"
-ENSEMBLE_WEIGHTS_PKL: Path = MODELS_DIR / "ensemble_weights.joblib"
 STACKER_PKL: Path = MODELS_DIR / "stacker.joblib"
+# Stores the stacker's base-model input order (kept for backwards-compat name).
+ENSEMBLE_WEIGHTS_PKL: Path = MODELS_DIR / "ensemble_weights.joblib"
 
 METRICS_JSON: Path = MODELS_DIR / "metrics.json"
 SHAP_SUMMARY_PNG: Path = MODELS_DIR / "shap_summary.png"
@@ -61,6 +60,10 @@ RECENCY_HALFLIFE: float = 5.0  # in matches; weight halves every 5 games back
 
 # Head-to-head look-back horizon.
 H2H_YEARS: int = 10
+
+# Common-opponents feature: how far back to look for shared opponents.
+COMMON_OPP_WINDOW: int = 30   # max recent matches per team to scan
+COMMON_OPP_YEARS: int = 4     # only opponents faced within this many years
 
 # Elo system.
 ELO_START: float = 1500.0

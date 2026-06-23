@@ -145,11 +145,15 @@ def main() -> None:
     teams = predictor.teams
     default_home = teams.index("Belgium") if "Belgium" in teams else 0
     default_away = teams.index("Netherlands") if "Netherlands" in teams else 1
+    # Defaults are geared toward the 2026 World Cup (hosted in the USA).
+    default_country = "United States" if "United States" in teams else teams[default_home]
+    default_tournament = (
+        predictor.tournaments.index("World Cup") if "World Cup" in predictor.tournaments else 0
+    )
     # The country selectbox owns its own state via a stable key so it is never
-    # reset to the home team on rerun. Seed the default once (to the home team's
-    # country) without coupling its `index` to the home selectbox.
+    # reset on rerun; seed its default once (to the United States).
     if "match_country" not in st.session_state:
-        st.session_state["match_country"] = teams[default_home]
+        st.session_state["match_country"] = default_country
 
     with st.form("prediction_form"):
         c1, c2 = st.columns(2)
@@ -157,13 +161,15 @@ def main() -> None:
             home = st.selectbox("Home Team", teams, index=default_home, key="home_team")
             country = st.selectbox(
                 "Country (where it is played)", teams, key="match_country",
-                help="Choose the home team's country for a home match. Any other "
-                     "country is treated as a neutral venue (detected automatically).",
+                help="Defaults to the United States. Choose the home team's country "
+                     "for a home match; any other country is treated as a neutral "
+                     "venue (detected automatically).",
             )
-            date = st.date_input("Date", value=pd.Timestamp("2026-09-10"))
+            date = st.date_input("Date", value=pd.Timestamp.today())
         with c2:
             away = st.selectbox("Away Team", teams, index=default_away, key="away_team")
-            tournament = st.selectbox("Tournament", predictor.tournaments, key="tournament")
+            tournament = st.selectbox("Tournament", predictor.tournaments,
+                                      index=default_tournament, key="tournament")
         submitted = st.form_submit_button("Predict", use_container_width=True, type="primary")
 
     if not submitted:
