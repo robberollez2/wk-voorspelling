@@ -7,16 +7,16 @@
   "dixon_coles_alpha": 3e-05,
   "test": {
     "xgboost": {
-      "accuracy": 0.5791453910239183,
-      "log_loss": 0.8991525769233704,
-      "brier_score": 0.5300970673561096,
-      "roc_auc_ovr_macro": 0.7317596012330082
+      "accuracy": 0.5796828809459823,
+      "log_loss": 0.9000327587127686,
+      "brier_score": 0.5306956171989441,
+      "roc_auc_ovr_macro": 0.7315609416222429
     },
     "lightgbm": {
-      "accuracy": 0.5780704111797904,
-      "log_loss": 0.9037955319546984,
-      "brier_score": 0.5327635245736126,
-      "roc_auc_ovr_macro": 0.7293553702420515
+      "accuracy": 0.5802203708680462,
+      "log_loss": 0.904842097492554,
+      "brier_score": 0.533071645575696,
+      "roc_auc_ovr_macro": 0.7275472866158733
     },
     "dixon_coles": {
       "accuracy": 0.582907820478366,
@@ -25,16 +25,16 @@
       "roc_auc_ovr_macro": 0.7505294536657221
     },
     "ensemble_mean": {
-      "accuracy": 0.5858640150497179,
-      "log_loss": 0.8811120223373322,
-      "brier_score": 0.5188901471191121,
-      "roc_auc_ovr_macro": 0.7465582910910142
+      "accuracy": 0.5850577801666219,
+      "log_loss": 0.881681967899848,
+      "brier_score": 0.5191979819602416,
+      "roc_auc_ovr_macro": 0.7456000305675609
     },
     "ensemble": {
-      "accuracy": 0.5901639344262295,
-      "log_loss": 0.8745491610210345,
-      "brier_score": 0.5165839501852453,
-      "roc_auc_ovr_macro": 0.7472885155867376
+      "accuracy": 0.5909701693093254,
+      "log_loss": 0.874044351701184,
+      "brier_score": 0.5161619283987696,
+      "roc_auc_ovr_macro": 0.7465763019323534
     },
     "goal_mae": {
       "home": 0.9625003027231864,
@@ -42,26 +42,26 @@
     }
   },
   "time_series_cv": {
-    "cv_log_loss_mean": 0.9084801077842712,
-    "cv_log_loss_std": 0.03493067393713725,
-    "cv_accuracy_mean": 0.5769024856596557,
-    "cv_accuracy_std": 0.024917824281890592
+    "cv_log_loss_mean": 0.9090255379676819,
+    "cv_log_loss_std": 0.03437543773345347,
+    "cv_accuracy_mean": 0.5759847036328873,
+    "cv_accuracy_std": 0.02485530221663121
   },
   "shap_top_features": {
-    "elo_expected_home": 0.24031339585781097,
-    "common_opp_goaldiff_diff": 0.10103629529476166,
-    "away_matches_played": 0.074365995824337,
-    "elo_difference": 0.06232127547264099,
-    "neutral": 0.03200850635766983,
-    "home_matches_played": 0.0221133753657341,
-    "away_goal_difference_last_5": 0.01787836290895939,
-    "tournament_importance": 0.01741216890513897,
-    "common_opp_points_diff": 0.017382947728037834,
-    "h2h_goal_difference": 0.014164764434099197,
-    "away_goals_conceded_last_5": 0.01293078064918518,
-    "home_elo_momentum": 0.01277738343924284,
-    "away_goals_scored_last_20": 0.012737256474792957,
-    "form_goal_diff_diff_10": 0.011964734643697739,
-    "away_weighted_goal_diff": 0.01155554223805666
+    "elo_expected_home": 0.2586604058742523,
+    "common_opp_goaldiff_diff": 0.10145407170057297,
+    "away_matches_played": 0.08052368462085724,
+    "elo_difference": 0.05280402675271034,
+    "home_matches_played": 0.03086824342608452,
+    "neutral": 0.027832623571157455,
+    "tournament_importance": 0.01960427686572075,
+    "away_goal_difference_last_5": 0.017301125451922417,
+    "common_opp_points_diff": 0.01605641096830368,
+    "h2h_matches": 0.015278050675988197,
+    "away_weighted_goal_diff": 0.014017079956829548,
+    "h2h_goal_difference": 0.01355005893856287,
+    "away_goals_conceded_last_5": 0.013525278307497501,
+    "home_elo_momentum": 0.012947365641593933,
+    "form_goal_diff_diff_10": 0.012483064085245132
   }
 }
